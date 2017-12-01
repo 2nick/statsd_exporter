@@ -22,6 +22,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -60,84 +62,152 @@ func hashNameAndLabels(name string, labels prometheus.Labels) uint64 {
 }
 
 type CounterContainer struct {
-	Elements map[uint64]prometheus.Counter
+	Elements  *sync.Map
+	metricTTL time.Duration
 }
 
-func NewCounterContainer() *CounterContainer {
-	return &CounterContainer{
-		Elements: make(map[uint64]prometheus.Counter),
+type MetricWithAccessTime interface {
+	prometheus.Metric
+	prometheus.Collector
+	Before(u time.Time) bool
+	Format(layout string) string
+}
+
+type CounterWithAccessTime struct {
+	prometheus.Counter
+	time.Time
+}
+
+func NewCounterContainer(metricTTL, expireLoopDuration time.Duration) *CounterContainer {
+	c := &CounterContainer{
+		Elements:  &sync.Map{},
+		metricTTL: metricTTL,
 	}
+
+	go runExpireLoop(expireLoopDuration, c.Elements)
+
+	return c
 }
 
 func (c *CounterContainer) Get(metricName string, labels prometheus.Labels) (prometheus.Counter, error) {
+	var counter *CounterWithAccessTime
+
 	hash := hashNameAndLabels(metricName, labels)
-	counter, ok := c.Elements[hash]
+	value, ok := c.Elements.Load(hash)
 	if !ok {
-		counter = prometheus.NewCounter(prometheus.CounterOpts{
-			Name:        metricName,
-			Help:        defaultHelp,
-			ConstLabels: labels,
-		})
-		if err := prometheus.Register(counter); err != nil {
-			return nil, err
-		}
-		c.Elements[hash] = counter
-	}
-	return counter, nil
-}
-
-type GaugeContainer struct {
-	Elements map[uint64]prometheus.Gauge
-}
-
-func NewGaugeContainer() *GaugeContainer {
-	return &GaugeContainer{
-		Elements: make(map[uint64]prometheus.Gauge),
-	}
-}
-
-func (c *GaugeContainer) Get(metricName string, labels prometheus.Labels) (prometheus.Gauge, error) {
-	hash := hashNameAndLabels(metricName, labels)
-	gauge, ok := c.Elements[hash]
-	if !ok {
-		gauge = prometheus.NewGauge(prometheus.GaugeOpts{
-			Name:        metricName,
-			Help:        defaultHelp,
-			ConstLabels: labels,
-		})
-		if err := prometheus.Register(gauge); err != nil {
-			return nil, err
-		}
-		c.Elements[hash] = gauge
-	}
-	return gauge, nil
-}
-
-type SummaryContainer struct {
-	Elements map[uint64]prometheus.Summary
-}
-
-func NewSummaryContainer() *SummaryContainer {
-	return &SummaryContainer{
-		Elements: make(map[uint64]prometheus.Summary),
-	}
-}
-
-func (c *SummaryContainer) Get(metricName string, labels prometheus.Labels) (prometheus.Summary, error) {
-	hash := hashNameAndLabels(metricName, labels)
-	summary, ok := c.Elements[hash]
-	if !ok {
-		summary = prometheus.NewSummary(
-			prometheus.SummaryOpts{
+		counter = &CounterWithAccessTime{
+			Counter: prometheus.NewCounter(prometheus.CounterOpts{
 				Name:        metricName,
 				Help:        defaultHelp,
 				ConstLabels: labels,
-			})
+			}),
+		}
+		if err := prometheus.Register(counter); err != nil {
+			return nil, err
+		}
+		c.Elements.Store(hash, counter)
+	} else {
+		counter = value.(*CounterWithAccessTime)
+	}
+
+	promoteMetricExpireAfter(c.metricTTL, counter, &counter.Time)
+
+	return counter.Counter, nil
+}
+
+type GaugeWithAccessTime struct {
+	prometheus.Gauge
+	time.Time
+}
+
+type GaugeContainer struct {
+	Elements  *sync.Map
+	metricTTL time.Duration
+}
+
+func NewGaugeContainer(metricTTL, expireLoopDuration time.Duration) *GaugeContainer {
+	c := &GaugeContainer{
+		Elements:  &sync.Map{},
+		metricTTL: metricTTL,
+	}
+
+	go runExpireLoop(expireLoopDuration, c.Elements)
+
+	return c
+}
+
+func (c *GaugeContainer) Get(metricName string, labels prometheus.Labels) (prometheus.Gauge, error) {
+	var gauge *GaugeWithAccessTime
+
+	hash := hashNameAndLabels(metricName, labels)
+	value, ok := c.Elements.Load(hash)
+	if !ok {
+		gauge = &GaugeWithAccessTime{
+			Gauge: prometheus.NewGauge(prometheus.GaugeOpts{
+				Name:        metricName,
+				Help:        defaultHelp,
+				ConstLabels: labels,
+			}),
+		}
+		if err := prometheus.Register(gauge); err != nil {
+			return nil, err
+		}
+
+		c.Elements.Store(hash, gauge)
+	} else {
+		gauge = value.(*GaugeWithAccessTime)
+	}
+
+	promoteMetricExpireAfter(c.metricTTL, gauge, &gauge.Time)
+
+	return gauge.Gauge, nil
+}
+
+type SummaryWithAccessTime struct {
+	prometheus.Summary
+	time.Time
+}
+
+type SummaryContainer struct {
+	Elements  *sync.Map
+	metricTTL time.Duration
+}
+
+func NewSummaryContainer(metricTTL, expireLoopDuration time.Duration) *SummaryContainer {
+	c := &SummaryContainer{
+		Elements:  &sync.Map{},
+		metricTTL: metricTTL,
+	}
+
+	go runExpireLoop(expireLoopDuration, c.Elements)
+
+	return c
+}
+
+func (c *SummaryContainer) Get(metricName string, labels prometheus.Labels) (prometheus.Summary, error) {
+	var summary *SummaryWithAccessTime
+
+	hash := hashNameAndLabels(metricName, labels)
+	value, ok := c.Elements.Load(hash)
+	if !ok {
+		summary = &SummaryWithAccessTime{
+			Summary: prometheus.NewSummary(prometheus.SummaryOpts{
+				Name:        metricName,
+				Help:        defaultHelp,
+				ConstLabels: labels,
+			}),
+		}
 		if err := prometheus.Register(summary); err != nil {
 			return nil, err
 		}
-		c.Elements[hash] = summary
+
+		c.Elements.Store(hash, summary)
+	} else {
+		summary = value.(*SummaryWithAccessTime)
 	}
+
+	promoteMetricExpireAfter(c.metricTTL, summary, &summary.Time)
+
 	return summary, nil
 }
 
@@ -294,12 +364,12 @@ func (b *Exporter) Listen(e <-chan Events) {
 	}
 }
 
-func NewExporter(mapper *metricMapper, addSuffix bool) *Exporter {
+func NewExporter(mapper *metricMapper, addSuffix bool, metricTTL, expireLoopDuration time.Duration) *Exporter {
 	return &Exporter{
 		addSuffix: addSuffix,
-		Counters:  NewCounterContainer(),
-		Gauges:    NewGaugeContainer(),
-		Summaries: NewSummaryContainer(),
+		Counters:  NewCounterContainer(metricTTL, expireLoopDuration),
+		Gauges:    NewGaugeContainer(metricTTL, expireLoopDuration),
+		Summaries: NewSummaryContainer(metricTTL, expireLoopDuration),
 		mapper:    mapper,
 	}
 }
@@ -467,4 +537,43 @@ func (l *StatsDListener) handlePacket(packet []byte, e chan<- Events) {
 		}
 	}
 	e <- events
+}
+
+func runExpireLoop(expireLoopDuration time.Duration, m *sync.Map) {
+	ticker := time.NewTicker(expireLoopDuration)
+	for t := range ticker.C {
+		m.Range(func(key, value interface{}) bool {
+			v, ok := value.(MetricWithAccessTime)
+			if !ok {
+				log.With("value", value).Debug("Error resolving value as MetricWithAccessTime")
+			} else if v.Before(time.Now()) {
+				log.With(
+					"metric",
+					v.Desc(),
+				).With(
+					"expireAfter",
+					v.Format(time.RFC3339),
+				).With(
+					"expiredAt",
+					t.Format(time.RFC3339),
+				).Debug("Metric expired")
+
+				prometheus.Unregister(v)
+				m.Delete(key)
+			}
+			return true
+		})
+	}
+}
+
+func promoteMetricExpireAfter(metricTTL time.Duration, m prometheus.Metric, val *time.Time) {
+	*val = time.Now().Add(metricTTL)
+
+	log.With(
+		"metric",
+		m.Desc(),
+	).With(
+		"expireAfter",
+		val.Format(time.RFC3339),
+	).Debug("Metric promoted")
 }
